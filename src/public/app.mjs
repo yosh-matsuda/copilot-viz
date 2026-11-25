@@ -4,6 +4,7 @@ import { createDetail } from './detail.mjs';
 import { createFeed } from './feed.mjs';
 import { createMap } from './map.mjs';
 import { createSessions } from './sessions.mjs';
+import { createSettings } from './settings.mjs';
 import { activityIn, createStore, isLive, sessionNow, sessionTitle, sortSessions, viewEnd, wallNow } from './store.mjs';
 import { createTimeline } from './timeline.mjs';
 import { CATEGORIES, CATEGORY_LABEL, fmtAgo, h, icon, reconcile, setData, setText } from './ui.mjs';
@@ -33,7 +34,7 @@ const SECONDS_MS = 65_000;
 const $ = (id) => document.getElementById(id);
 const el = {
   live: $('stat-live'), working: $('stat-working'), waiting: $('stat-waiting'), calls: $('stat-calls'),
-  conn: $('conn'), theme: $('theme'), follow: $('follow'),
+  conn: $('conn'), theme: $('theme'), follow: $('follow'), settings: $('settings-open'),
   overlay: $('overlay'), overlayTitle: $('overlay-title'), overlayText: $('overlay-text'),
   overlayCmd: document.querySelector('.overlay-cmd'),
 };
@@ -101,6 +102,7 @@ const detail = createDetail(
   { panel: $('detail'), title: $('detail-title'), body: $('detail-body'), close: $('detail-close'), cover: document.querySelector('.feed-panel') },
   { fetchCall, onClose: closeDetail, onFocusCall: focusCall, onChange: () => invalidate('detail'), isConnected: () => conn === 'live' },
 );
+const settings = createSettings($('settings'), { request: settingsRequest });
 
 function changed(name, ...next) {
   const prev = inputs.get(name);
@@ -355,6 +357,7 @@ function render() {
   if (changed('detail', view.focus && s, view.focus, view.focus && second(clock), conn)) detail.render(s, view.focus, clock);
   const n = cachedCounts(at);
   if (changed('stats', n.live, n.working, n.waiting, n.calls)) renderStats(n);
+  settings.updateHosts(store.hosts);
   renderTitle(conn === 'live' ? n.waitingSessions : 0);
 }
 
@@ -367,12 +370,14 @@ function setConn(state, text = CONN_TEXT[state]) {
     tickTimer = 0;
   } else if (!tickTimer) tickTimer = setInterval(tick, 1000);
   conn = state;
+  el.settings.disabled = state !== 'live';
   if (state !== 'live') renderTitle(0);
   setData(el.conn, 'state', state === 'refused' ? 'offline' : state);
   setText(el.conn, text);
 }
 
 function showOverlay(title, text, command = true) {
+  settings.close();
   setText(el.overlayTitle, title);
   setText(el.overlayText, text);
   el.overlayCmd.hidden = !command;
@@ -538,6 +543,19 @@ async function fetchCall(sid, id, epoch) {
   return r.json();
 }
 
+async function settingsRequest(path, { method = 'GET', body, signal } = {}) {
+  const es = source;
+  const r = await fetch(path, {
+    method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000), cache: 'no-store',
+  });
+  if (r.status === 401 && es && source === es) probe(es);
+  const result = await r.json();
+  if (!r.ok) throw new Error(typeof result.error === 'string' ? result.error : `HTTP ${r.status}`);
+  return result;
+}
+
 // A pairing code works once, so it leaves the address before it is sent.
 async function pair() {
   const url = new URL(location.href);
@@ -573,11 +591,19 @@ for (const b of filterButtons) b.addEventListener('click', () => setFilter(b.dat
 for (const b of zoomButtons) b.addEventListener('click', () => setZoom(Number(b.dataset.zoom)));
 el.follow.addEventListener('click', toggleFollow);
 el.theme.addEventListener('click', toggleTheme);
+el.settings.addEventListener('click', () => settings.open());
 darkQuery.addEventListener('change', () => applyTheme(document.documentElement.dataset.theme));
 document.addEventListener('visibilitychange', reportView);
 
 addEventListener('keydown', (e) => {
   if (e.isComposing || e.ctrlKey || e.metaKey || e.altKey || !el.overlay.hidden) return;
+  if (settings.isOpen()) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      settings.cancel();
+    }
+    return;
+  }
   if (e.target instanceof Element && e.target.closest('input, textarea, select, [contenteditable]')) return;
   // The VS Code integrated browser marks Escape as handled before the page sees it.
   if (e.key === 'Escape') {
@@ -603,6 +629,7 @@ addEventListener('hashchange', () => {
 // Another tab that pairs with a new server shares its token with this one.
 addEventListener('storage', (e) => {
   if (e.key === TOKEN_KEY && e.newValue && e.newValue !== token) {
+    settings.close();
     token = e.newValue;
     pairError = null;
     connect();
@@ -614,6 +641,7 @@ addEventListener('storage', (e) => {
 // --- start ------------------------------------------------------------------------------
 
 $('detail-close').replaceChildren(icon('close'));
+el.settings.prepend(icon('settings'));
 $('legend').replaceChildren(
   ...CATEGORIES.map((c) => h('span', { 'data-cat': c, text: CATEGORY_LABEL[c] })),
   h('span', { 'data-phase': 'idle', text: 'Idle' }),

@@ -72,6 +72,19 @@ export async function startDemo() {
       const detail = demo.callDetail(url.searchParams.get('sid'), url.searchParams.get('id'), url.searchParams.get('epoch') ?? undefined);
       return json(res, detail ? 200 : 404, detail ?? { error: 'Unknown demo call.' });
     }
+    if (url.pathname === '/api/settings' || url.pathname === '/api/remotes/check') {
+      if (req.headers.authorization !== 'Bearer synthetic-demo') return json(res, 401, { error: 'Use the demo link.' });
+      if (url.pathname !== '/api/settings' || req.method !== 'GET') {
+        return json(res, 403, { error: 'The synthetic demo cannot change settings or run SSH.' });
+      }
+      const runtime = { sinceMs: 864e5, idleExitMs: 600_000, remotePauseMs: 600_000 };
+      const remotes = demo.snapshot().hosts.filter((host) => host.remote).map((host) => ({ host: host.name, node: 'node' }));
+      return json(res, 200, {
+        path: '(synthetic demo)', revision: null, hostname: 'laptop', readOnly: true,
+        readOnlyReason: 'Synthetic demo only. Settings cannot be saved and no SSH commands are run.',
+        config: { version: 2, remotes }, appliedRemotes: remotes, runtime, defaults: runtime,
+      });
+    }
     const asset = assets.get(url.pathname);
     if (asset && (req.method === 'GET' || req.method === 'HEAD')) {
       res.writeHead(200, { 'Content-Type': asset.type, 'Content-Length': asset.body.length, 'Cache-Control': 'no-store' });

@@ -7,11 +7,13 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { unlinkSync, writeFileSync } from 'node:fs';
 import { chmod, link, lstat, readFile, rename, unlink } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { endianness, release } from 'node:os';
+import { endianness, hostname as machineName, release } from 'node:os';
 import { join } from 'node:path';
+import { MAX_CONFIG_BYTES, readConfig, resolveSettings, RUNTIME_DEFAULTS, validateConfig, validateRemote, writeConfig } from './config.mjs';
 import { copilotHome } from './monitor.mjs';
 import { workerBundle } from './deploy.mjs';
-import { loadRemotes } from './remote.mjs';
+import { record } from './public/schema.mjs';
+import { checkRemote } from './remote.mjs';
 import { createSources } from './sources.mjs';
 import { codeVersion, control, DEFAULT_PORT, HERE, runtimeDir, socketPath } from './runtime.mjs';
 
@@ -179,8 +181,8 @@ function readBody(req, limit) {
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > limit) {
-        reject(new Error('request body too large'));
-        req.destroy();
+        chunks.length = 0;
+        reject(Object.assign(new Error('request body too large'), { status: 413 }));
       } else {
         chunks.push(chunk);
       }
@@ -193,11 +195,18 @@ function readBody(req, limit) {
 const frame = (msg) => `data: ${JSON.stringify(msg)}\n\n`;
 
 export async function startServer({
-  port = DEFAULT_PORT, sinceMs = 864e5, idleExitMs = 0, remotePauseMs = 600_000, log = (m) => process.stderr.write(`${m}\n`),
+  port = DEFAULT_PORT, sinceMs, idleExitMs, remotePauseMs, defaultIdleExitMs = 0,
+  log = (m) => process.stderr.write(`${m}\n`),
 } = {}) {
   const home = copilotHome();
-  const remotes = await loadRemotes(home);
-  const bundle = remotes.some((r) => !r.script) ? await workerBundle() : null;
+  let saved = await readConfig(home);
+  const overrides = Object.fromEntries(Object.entries({ sinceMs, idleExitMs, remotePauseMs }).filter(([, value]) => value !== undefined));
+  const launchDefaults = { ...RUNTIME_DEFAULTS, idleExitMs: defaultIdleExitMs };
+  const defaults = { ...launchDefaults, ...overrides };
+  ({ sinceMs, idleExitMs, remotePauseMs } = { ...resolveSettings(saved.config, launchDefaults), ...overrides });
+  let remotes = saved.config.remotes;
+  // A host added later must use this server's worker, even after an upgrade on disk.
+  const bundle = await workerBundle();
   const dir = await runtimeDir();
   const sock = socketPath(dir);
   const version = await codeVersion();
@@ -223,23 +232,127 @@ export async function startServer({
   let ownIno = null;
   let closing = false;
   let errors = 0;
+  let configError = null;
+  let settingsWork = null;
+  let settingsVersion = 0;
+  const settingsAbort = new AbortController();
+  const probes = new Set();
 
   const report = (what, err) => {
     if (++errors <= 20) log(`copilot-viz: ${what}: ${err?.stack ?? err}`);
     else if (errors === 21) log('copilot-viz: more errors follow; only the count is kept');
   };
-  const sources = createSources({
-    remotes, bundle, sinceMs, onMessage: broadcast,
+  const makeSources = () => createSources({
+    home, remotes, bundle, sinceMs, onMessage: broadcast,
     onError: (err) => report('collecting sessions', err),
   });
+  let sources = makeSources();
 
   const status = () => ({
     pid: process.pid, copilotHome: home, peerWarning, version, startedAt, requestedPort: port, port: actualPort, url: actualPort ? `http://127.0.0.1:${actualPort}/` : null,
     ready: sources.snapshot().ready, sinceMs, idleExitMs, remotePauseMs, remotesPaused, clients: clients.size,
     visibleClients: [...clients.values()].filter((c) => c.visible).length,
     sessions: sources.snapshot().sessions.length, hosts: sources.snapshot().hosts, remotes, errors,
+    config: saved.config, configRevision: saved.revision, configError, settingsVersion, settingsPending: Boolean(settingsWork),
   });
   const snapshot = () => sources.snapshot();
+  const settingsView = (disk) => ({
+    ...disk, hostname: machineName(), defaults, runtime: { sinceMs, idleExitMs, remotePauseMs },
+    appliedRemotes: saved.config.remotes, error: configError,
+  });
+
+  async function applySettings(config) {
+    const next = resolveSettings(config, defaults);
+    if (closing) throw Object.assign(new Error('The server is stopping.'), { status: 503 });
+    if (next.sinceMs !== sinceMs || configError) {
+      await sources.stop();
+      if (closing) throw Object.assign(new Error('The server is stopping.'), { status: 503 });
+      ({ sinceMs, idleExitMs, remotePauseMs } = next);
+      remotes = config.remotes;
+      sources = makeSources();
+      if (!remotePauseMs || !remotes.length) remotesPaused = false;
+      broadcast(snapshot());
+      if (remotesPaused) sources.pause();
+      await sources.start();
+    } else {
+      if (JSON.stringify(config.remotes) !== JSON.stringify(remotes)) await sources.updateRemotes(config.remotes);
+      if (closing) throw Object.assign(new Error('The server is stopping.'), { status: 503 });
+      ({ sinceMs, idleExitMs, remotePauseMs } = next);
+      remotes = config.remotes;
+      if (remotesPaused && (!remotePauseMs || !remotes.length)) {
+        remotesPaused = false;
+        sources.resume();
+      }
+    }
+    if (closing) throw Object.assign(new Error('The server is stopping.'), { status: 503 });
+    clearTimeout(pauseTimer);
+    pauseTimer = null;
+    watchViewers();
+  }
+
+  async function settingsBody(req) {
+    const body = await readBody(req, MAX_CONFIG_BYTES);
+    try {
+      return JSON.parse(body);
+    } catch {
+      throw Object.assign(new Error('Invalid JSON in the settings request.'), { status: 400 });
+    }
+  }
+
+  async function saveSettings(req, res) {
+    const body = await settingsBody(req);
+    if (!record(body) || !Object.hasOwn(body, 'revision') || !(body.revision === null || (typeof body.revision === 'string' && /^[a-f0-9]{64}$/.test(body.revision)))
+      || Object.keys(body).some((key) => !['revision', 'config'].includes(key))) {
+      return json(res, 400, { error: 'Expected a configuration and the revision returned by Settings.' });
+    }
+    const config = validateConfig(body.config);
+    if (closing) return json(res, 503, { error: 'The server is stopping.' });
+    if (settingsWork) return json(res, 409, { error: 'Settings are already being saved. Reload saved settings when that save finishes.' });
+    settingsVersion++;
+    settingsWork = (async () => {
+      let committed = false;
+      try {
+        const written = await writeConfig(home, config, body.revision, { signal: settingsAbort.signal });
+        committed = true;
+        await applySettings(config);
+        saved = written;
+        configError = null;
+        return settingsView(written);
+      } catch (e) {
+        if (committed) {
+          configError = `Settings were saved, but could not be applied: ${e.message} Run copilot-viz again, or choose Reload saved settings before Save and apply.`;
+          throw Object.assign(e, { status: 500, publicMessage: configError });
+        }
+        throw Object.assign(e, { publicMessage: `Could not save settings: ${e.message}` });
+      }
+    })();
+    try {
+      return json(res, 200, await settingsWork);
+    } finally {
+      settingsWork = null;
+    }
+  }
+
+  async function remoteCheck(req, res) {
+    const body = await settingsBody(req);
+    if (!record(body) || Object.keys(body).some((key) => key !== 'remote')) {
+      return json(res, 400, { error: 'Expected a remote host to check.' });
+    }
+    const remote = validateRemote(body.remote);
+    if (closing) return json(res, 503, { error: 'The server is stopping.' });
+    if (probes.size >= 2) return json(res, 429, { error: 'Two SSH checks are already running. Wait for one to finish.' });
+    const probe = { controller: new AbortController(), done: null };
+    const cancel = () => { if (!res.writableEnded) probe.controller.abort(); };
+    res.once('close', cancel);
+    probes.add(probe);
+    probe.done = checkRemote(remote, { signal: probe.controller.signal });
+    try {
+      return json(res, 200, await probe.done);
+    } finally {
+      res.off('close', cancel);
+      probes.delete(probe);
+    }
+  }
 
   // SSH to the remote hosts closes once no page has been in view for remotePauseMs, and opens
   // again as soon as one is.
@@ -312,6 +425,10 @@ export async function startServer({
       // The caller names the server it saw, so it does not stop one that replaced it.
       const pid = url.searchParams.get('pid');
       if (pid !== null && Number(pid) !== process.pid) return send(409, { error: 'another server', pid: process.pid });
+      const version = url.searchParams.get('settingsVersion');
+      if (version !== null && (settingsWork || version !== String(settingsVersion))) {
+        return send(409, { error: 'settings changed; read status again' });
+      }
       send(200, { ok: true });
       // At once, so that no request after this one gets a link. The control socket closes only
       // after this reply is sent.
@@ -456,6 +573,22 @@ export async function startServer({
       if (path === '/api/pair' && req.method === 'POST') return await pair(req, res);
       if (path === '/api/stream' && req.method === 'GET') return stream(req, res, url.searchParams.get('token'));
       if (path === '/api/view' && req.method === 'POST') return await reportView(req, res);
+      if (path === '/api/settings' && (req.method === 'GET' || req.method === 'PUT')) {
+        if (!bearer(req)) return json(res, 401, { error: 'unauthorized' });
+        if (req.method === 'PUT') return await saveSettings(req, res);
+        if (settingsWork) return json(res, 409, { error: 'Settings are being applied. Try reloading when saving finishes.' });
+        let disk;
+        try {
+          disk = await readConfig(home);
+        } catch (e) {
+          throw Object.assign(e, { publicMessage: e.message });
+        }
+        return json(res, 200, settingsView(disk));
+      }
+      if (path === '/api/remotes/check' && req.method === 'POST') {
+        if (!bearer(req)) return json(res, 401, { error: 'unauthorized' });
+        return await remoteCheck(req, res);
+      }
       if (path === '/api/state' && req.method === 'GET') {
         if (!bearer(req)) return json(res, 401, { error: 'unauthorized' });
         return json(res, 200, snapshot());
@@ -471,10 +604,11 @@ export async function startServer({
       }
       return json(res, 404, { error: 'not found' });
     } catch (e) {
-      if (e.status === 409 || e.status === 503) return json(res, e.status, { error: e.message });
+      if (e.name === 'AbortError' && res.destroyed) return undefined;
+      if ([400, 409, 413, 422, 429, 502, 503, 504].includes(e.status)) return json(res, e.status, { error: e.publicMessage ?? e.message });
       // The query may hold the token or a pairing code.
       report(`${req.method} ${(req.url ?? '').split('?')[0]}`, e);
-      if (!res.headersSent) return json(res, 500, { error: 'internal error' });
+      if (!res.headersSent) return json(res, 500, { error: e.publicMessage ?? 'internal error' });
       return res.destroy();
     }
   }
@@ -503,6 +637,8 @@ export async function startServer({
     if (closing) return;
     closing = true;
     log(`copilot-viz: stopping: ${reason}`);
+    settingsAbort.abort(Object.assign(new Error('The server is stopping.'), { status: 503 }));
+    for (const probe of probes) probe.controller.abort();
     clearTimeout(pauseTimer);
     for (const file of launchFiles.keys()) removeLaunchFile(file);
     const stopped = sources.stop();
@@ -512,7 +648,15 @@ export async function startServer({
       http.closeAllConnections();
       http.close();
     }
-    Promise.all([stopped, unclaim(), new Promise((resolve) => ctl.close(resolve))]).then(
+    // A save can own retiring SSH children that are no longer in the current host map.
+    // Its HTTP handler reports failures; shutdown only waits for it and the checks to settle.
+    const pending = Promise.allSettled([settingsWork, ...[...probes].map((probe) => probe.done)]);
+    Promise.allSettled([stopped, pending]).then(async (results) => {
+      await unclaim();
+      await new Promise((resolve) => ctl.close(resolve));
+      const failures = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+      if (failures.length) throw new AggregateError(failures, 'Could not stop all server work.');
+    }).then(
       () => process.exit(0),
       (e) => { report('stopping sources', e); process.exit(1); },
     );
@@ -535,18 +679,22 @@ export async function startServer({
   timers.push(setInterval(async () => {
     if ((await lstat(sock).catch(() => null))?.ino !== ownIno) shutdown('the control socket was removed or replaced');
   }, OWNER_CHECK_MS));
-  if (idleExitMs > 0) {
-    timers.push(setInterval(() => {
-      const now = Date.now();
-      if (clients.size || now - idleSince < idleExitMs) return;
-      for (const expires of codes.values()) if (expires > now) return;
-      shutdown(`no viewer for ${Math.round(idleExitMs / 60_000)} minutes`);
-    }, IDLE_CHECK_MS));
-  }
+  timers.push(setInterval(() => {
+    const now = Date.now();
+    if (!idleExitMs || clients.size || now - idleSince < idleExitMs) return;
+    for (const expires of codes.values()) if (expires > now) return;
+    shutdown(`no viewer for ${Math.round(idleExitMs / 60_000)} minutes`);
+  }, IDLE_CHECK_MS));
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => shutdown(sig));
 
   log(`copilot-viz: serving http://127.0.0.1:${actualPort}/ (pid ${process.pid}, control ${sock})`);
-  sources.start();
+  const initialSources = sources;
+  initialSources.start().catch((e) => {
+    if (!closing && sources === initialSources) {
+      configError = `Session collection could not start: ${e.message} Run copilot-viz again to retry.`;
+      report('starting sources', e);
+    }
+  });
   watchViewers();
   return { port: actualPort, sock, launchUrl, shutdown };
 }

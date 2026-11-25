@@ -1,6 +1,6 @@
 {
   "name": "copilot-viz",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A live browser dashboard of the agents, subagents, tool calls, and shells of GitHub Copilot CLI sessions, on this machine and over SSH.",
   "keywords": [
     "github-copilot",

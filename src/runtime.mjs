@@ -12,7 +12,7 @@ export const HERE = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_PORT = 7421;
 // The import closure of cli.mjs, server.mjs and worker.mjs; a test keeps this list in step.
 export const SERVER_FILES = [
-  'cli.mjs', 'collector.mjs', 'deploy.mjs', 'model.mjs', 'monitor.mjs', 'public/schema.mjs', 'remote.mjs', 'runtime.mjs',
+  'cli.mjs', 'collector.mjs', 'config.mjs', 'deploy.mjs', 'model.mjs', 'monitor.mjs', 'public/schema.mjs', 'remote.mjs', 'runtime.mjs',
   'server.mjs', 'sources.mjs', 'wire.mjs', 'worker.mjs',
 ];
 const HAS_PROC = existsSync('/proc/self/stat');

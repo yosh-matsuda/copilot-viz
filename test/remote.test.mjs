@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { createModel } from '../src/model.mjs';
-import { createRemote, loadRemotes, sshArgs } from '../src/remote.mjs';
+import { checkArgs, checkRemote, createRemote, loadRemotes, sshArgs } from '../src/remote.mjs';
 import { HERE } from '../src/runtime.mjs';
 import { createSources } from '../src/sources.mjs';
 import { createStore, isLive, sessionNow, sortSessions } from '../src/public/store.mjs';
@@ -68,6 +68,189 @@ test('remote configuration rejects invalid hosts and quotes remote paths literal
   assert.ok(args.includes('-x'));
   const out = await new Promise((resolve, reject) => execFile('sh', ['-c', args.at(-1)], (err, stdout) => err ? reject(err) : resolve(stdout)));
   assert.deepEqual(JSON.parse(out), ['--since', '1234', '--home', "a ' home"]);
+});
+
+test('the SSH check uses literal paths, a fresh connection, and the same Copilot home as the worker', async (t) => {
+  const home = await temporary(t);
+  const remoteHome = join(home, "copilot ' home");
+  await mkdir(join(remoteHome, 'session-state'), { recursive: true });
+  const config = { host: 'lab', node: process.execPath, copilotHome: remoteHome, script: 'must-not-run.mjs' };
+  const args = checkArgs(config);
+  for (const flag of ['BatchMode=yes', 'StrictHostKeyChecking=yes', 'ControlPath=none', 'UpdateHostKeys=no', 'CheckHostIP=no']) assert.ok(args.includes(flag));
+  assert.equal(args.at(-1).includes(config.script), false);
+  const result = await checkRemote(config, { spawnProcess: (_, args, options) => spawn('sh', ['-c', args.at(-1)], options) });
+  assert.equal(result.sessions, true);
+  assert.equal(result.copilotHome, remoteHome);
+  assert.equal(result.nodePath, process.execPath);
+  const empty = await checkRemote({ ...config, copilotHome: join(home, 'missing') }, {
+    spawnProcess: (_, args, options) => spawn('sh', ['-c', args.at(-1)], options),
+  });
+  assert.equal(empty.sessions, false);
+  const file = join(home, 'not-a-directory');
+  await writeFile(file, '');
+  await assert.rejects(checkRemote({ ...config, copilotHome: file }, {
+    spawnProcess: (_, args, options) => spawn('sh', ['-c', args.at(-1)], options),
+  }), /ENOTDIR|not a directory/);
+});
+
+test('SSH checks report failed authentication, old Node, malformed replies, and excessive output', async () => {
+  const reply = { nodeVersion: '22.0.0', nodePath: '/usr/bin/node', copilotHome: '/home/demo/.copilot', sessions: false };
+  for (const [code, stdout, stderr, expected] of [
+    [255, '', 'Permission denied (publickey).', /Permission denied/],
+    [0, JSON.stringify({ ...reply, nodeVersion: '18.0.0' }), '', /Node.js 22/],
+    [0, 'welcome\n' + JSON.stringify(reply), '', /Unexpected output/],
+    [0, JSON.stringify({ ...reply, sessions: 'yes' }), '', /valid Node.js result/],
+    [0, 'x'.repeat(16385), '', /too much output/],
+  ]) {
+    const child = fakeChild();
+    const result = checkRemote({ host: 'lab' }, { spawnProcess: () => child });
+    child.stderr.write(stderr);
+    child.stdout.write(stdout);
+    child.emit('close', code, null);
+    await assert.rejects(result, expected);
+  }
+});
+
+test('a timed-out or cancelled SSH check waits for its child to close before settling', async () => {
+  const child = fakeChild();
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === 'SIGKILL') queueMicrotask(() => child.emit('close', null, signal));
+    return true;
+  };
+  let settled = false;
+  const result = checkRemote({ host: 'lab' }, { spawnProcess: () => child, timeoutMs: 20, killMs: 20 });
+  result.then(() => { settled = true; }, () => { settled = true; });
+  await sleep(25);
+  assert.equal(settled, false);
+  await assert.rejects(result, { status: 504 });
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  const controller = new AbortController();
+  const cancelled = checkRemote({ host: 'lab' }, { spawnProcess: fakeChild, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(cancelled, { name: 'AbortError' });
+});
+
+test('editing hosts preserves local and unchanged sessions, drops late callbacks, and renews epochs', async (t) => {
+  const home = await temporary(t);
+  await mkdir(join(home, 'session-state', 'local'), { recursive: true });
+  await writeFile(join(home, 'session-state', 'local', 'events.jsonl'), '');
+  const connections = [];
+  const store = createStore();
+  const raw = session();
+  const sources = createSources({
+    home, onMessage: (m) => store.apply(m), onError: (e) => assert.fail(e.message),
+    remoteFactory: (config, callbacks) => {
+      const connection = {
+        config, callbacks, starts: 0, stops: 0, paused: false,
+        start() { this.starts++; if (!this.paused) callbacks.onMessage(snapshot([raw])); },
+        pause() { this.paused = true; callbacks.onState('paused', null, null); },
+        resume() { this.paused = false; callbacks.onMessage(snapshot([raw])); },
+        async stop() { this.stops++; },
+        call: async () => ({ preview: config.node }),
+      };
+      connections.push(connection);
+      return connection;
+    },
+  });
+  t.after(() => sources.stop());
+  await sources.start();
+  await waitFor(() => store.ready && store.sessions.has('local'));
+  const local = store.sessions.get('local');
+  assert.equal(local.hostName, null);
+  const a = { host: 'a', node: 'node' };
+  const b = { host: 'b', node: 'node' };
+  await sources.updateRemotes([a, b]);
+  assert.equal(store.sessions.get('local').epoch, local.epoch);
+  assert.ok(store.sessions.get('local').hostName);
+  const original = store.sessions.get('a/same');
+  const unchanged = store.sessions.get('b/same');
+  await sources.updateRemotes([{ ...a, node: 'new-node' }, b]);
+  assert.equal(connections[0].stops, 1);
+  assert.equal(connections[1].stops, 0);
+  assert.equal(connections[1].starts, 1);
+  assert.equal(store.sessions.get('b/same'), unchanged);
+  assert.notEqual(store.sessions.get('a/same').epoch, original.epoch);
+  const rev = store.rev;
+  connections[0].callbacks.onMessage(snapshot([session('late')]));
+  connections[0].callbacks.onState('offline', 'late failure', null);
+  assert.equal(store.rev, rev);
+  assert.equal(store.sessions.has('a/late'), false);
+  await assert.rejects(sources.callDetail(original.id, 'call', original.epoch), { status: 409 });
+  await sources.updateRemotes([]);
+  assert.deepEqual([...store.sessions.keys()], ['local']);
+  assert.equal(store.sessions.get('local').hostName, null);
+  assert.equal(sources.snapshot().sessions[0].hostName, null);
+  sources.pause();
+  await sources.updateRemotes([a]);
+  assert.equal(connections.at(-1).paused, true);
+  assert.equal(store.hosts.get('ssh:a').state, 'paused');
+  assert.equal(store.sessions.has('a/same'), false);
+  sources.resume();
+  assert.notEqual(store.sessions.get('a/same').epoch, original.epoch);
+  await sources.stop();
+});
+
+test('source shutdown waits for a removed connection and never starts its replacement', async () => {
+  let release;
+  const exits = new Promise((resolve) => { release = resolve; });
+  const connections = [];
+  const sources = createSources({
+    remotes: [{ host: 'lab', node: 'old' }], onMessage() {}, onError: (e) => assert.fail(e.message),
+    remoteFactory: () => {
+      const connection = { starts: 0, start() { this.starts++; }, stop: connections.length ? async () => {} : () => exits };
+      connections.push(connection);
+      return connection;
+    },
+  });
+  const update = sources.updateRemotes([{ host: 'lab', node: 'new' }]);
+  const rejected = assert.rejects(update, { status: 503 });
+  let stopped = false;
+  const stop = sources.stop().then(() => { stopped = true; });
+  await sleep(10);
+  assert.equal(stopped, false);
+  release();
+  await Promise.all([stop, rejected]);
+  assert.equal(connections[1].starts, 0);
+});
+
+test('visibility changes during a host replacement start one SSH child only after its predecessor exits', { timeout: 5000 }, async (t) => {
+  const home = await temporary(t);
+  const children = [];
+  const sources = createSources({
+    home, remotes: [{ host: 'lab', node: 'old', script: 'worker.mjs' }], onMessage() {}, onError: (e) => assert.fail(e.message),
+    remoteFactory: (config, options) => createRemote(config, {
+      ...options,
+      spawnProcess() {
+        const child = fakeChild();
+        child.signals = [];
+        const first = children.length === 0;
+        child.kill = (signal) => {
+          child.signals.push(signal);
+          if (!first) queueMicrotask(() => child.emit('close', null, signal));
+          return true;
+        };
+        children.push(child);
+        return child;
+      },
+    }),
+  });
+  t.after(async () => {
+    for (const child of children) child.emit('close', 0, null);
+    await sources.stop();
+  });
+  await sources.start();
+  const updating = sources.updateRemotes([{ host: 'lab', node: 'new', script: 'worker.mjs' }]);
+  await waitFor(() => children[0].signals.includes('SIGTERM'));
+  sources.pause();
+  sources.resume();
+  assert.equal(children.length, 1, 'the replacement must wait for the old child');
+  children[0].emit('close', null, 'SIGTERM');
+  await updating;
+  assert.equal(children.length, 2);
+  await sources.stop();
+  assert.deepEqual(children[1].signals, ['SIGTERM']);
 });
 
 test('sources isolate identical session IDs, retain disconnected data and route details by epoch', async (t) => {

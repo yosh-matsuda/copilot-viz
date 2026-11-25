@@ -1,40 +1,11 @@
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readConfig, validateRemote } from './config.mjs';
 import { BOOT, INSTALL, MISSING_EXIT, MISSING_MARK, UNSUPPORTED_EXIT } from './deploy.mjs';
-import { copilotHome } from './monitor.mjs';
+import { record } from './public/schema.mjs';
 import { encodeMessage, HEARTBEAT_MS, PROTOCOL, readMessages, unavailable } from './wire.mjs';
 
-const HOST = /^[a-zA-Z0-9_][a-zA-Z0-9_.@:[\]-]{0,127}$/;
-const text = (s) => typeof s === 'string' && s.length > 0 && s.length <= 1024 && !/[\x00-\x1f\x7f]/.test(s);
-
-export async function loadRemotes(home = copilotHome()) {
-  const path = join(home, 'copilot-viz.json');
-  let body;
-  try {
-    body = await readFile(path, 'utf8');
-  } catch (e) {
-    if (e.code === 'ENOENT') return [];
-    throw new Error(`Cannot read ${path}: ${e.message}`);
-  }
-  let config;
-  try {
-    config = JSON.parse(body);
-  } catch {
-    throw new Error(`Invalid JSON in ${path}.`);
-  }
-  if (!config || config.version !== 1 || !Array.isArray(config.remotes) || config.remotes.length > 32
-    || Object.keys(config).some((k) => !['version', 'remotes'].includes(k))) throw new Error(`Expected version 1 and up to 32 remotes in ${path}.`);
-  const seen = new Set();
-  return config.remotes.map((r) => {
-    if (!r || typeof r !== 'object' || typeof r.host !== 'string' || !HOST.test(r.host) || seen.has(r.host)
-      || Object.keys(r).some((k) => !['host', 'node', 'script', 'copilotHome'].includes(k))
-      || ['node', 'script', 'copilotHome'].some((k) => r[k] !== undefined && !text(r[k]))) {
-      throw new Error(`Invalid or duplicate remote in ${path}; use an SSH Host name and optional node, script and copilotHome paths.`);
-    }
-    seen.add(r.host);
-    return { host: r.host, node: r.node ?? 'node', ...(r.script ? { script: r.script } : {}), ...(r.copilotHome ? { copilotHome: r.copilotHome } : {}) };
-  });
+export async function loadRemotes(home) {
+  return (await readConfig(home)).config.remotes;
 }
 
 const quote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
@@ -60,6 +31,96 @@ function sshCommand(config, args) {
     '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3',
     '--', config.host, `sh -c ${quote(command)}`,
   ];
+}
+
+// Like the deployment scripts, this passes through a fish login shell: no quote or backslash.
+const PROBE = `
+var fs = require("fs"), os = require("os"), path = require("path");
+var home = process.argv[1] || process.env.COPILOT_HOME || path.join(os.homedir(), ".copilot");
+var result = { nodeVersion: process.versions.node, nodePath: process.execPath, copilotHome: path.resolve(home), sessions: false };
+try {
+  if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Node.js 22 or later is required.");
+  var dir = path.join(home, "session-state");
+  try {
+    if (!fs.statSync(dir).isDirectory()) throw new Error(dir + " is not a directory.");
+    fs.accessSync(dir, fs.constants.R_OK | fs.constants.X_OK);
+    result.sessions = true;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+} catch (error) {
+  result.error = error.message;
+  process.exitCode = 1;
+}
+process.stdout.write(JSON.stringify(result));
+`;
+
+export function checkArgs(config) {
+  return [
+    '-o', 'UpdateHostKeys=no', '-o', 'CheckHostIP=no', '-o', 'ControlPath=none',
+    ...sshCommand(config, [config.node, '--input-type=commonjs', '-e', PROBE, '--', config.copilotHome ?? '']),
+  ];
+}
+
+export async function checkRemote(value, { spawnProcess = spawn, signal, timeoutMs = 15_000, killMs = 1000 } = {}) {
+  const config = validateRemote(value);
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const child = spawnProcess('ssh', checkArgs(config), { stdio: ['ignore', 'pipe', 'pipe'] });
+    const failure = (message, status = 502) => Object.assign(new Error(message), { status });
+    let stdout = '';
+    let stderr = '';
+    let bytes = 0;
+    let error;
+    let closed = false;
+    let escalation;
+    const terminate = (reason) => {
+      if (closed || error) return;
+      error = reason;
+      child.kill('SIGTERM');
+      escalation = setTimeout(() => child.kill('SIGKILL'), killMs);
+    };
+    const abort = () => terminate(signal.reason);
+    const timer = setTimeout(() => terminate(failure('SSH check timed out. Check the host name, network, and SSH configuration.', 504)), timeoutMs);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 16384) terminate(failure('SSH check returned too much output. Check non-interactive shell startup output.'));
+      else stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-4096); });
+    child.stdout.on('error', (e) => terminate(failure(`Cannot read the SSH check: ${e.message}`)));
+    child.stderr.on('error', (e) => terminate(failure(`Cannot read SSH errors: ${e.message}`)));
+    child.on('error', (e) => terminate(failure(`Cannot run SSH: ${e.message}`)));
+    child.once('close', (code, exitSignal) => {
+      closed = true;
+      clearTimeout(timer);
+      clearTimeout(escalation);
+      signal?.removeEventListener('abort', abort);
+      if (error) return reject(error);
+      let result;
+      try {
+        result = JSON.parse(stdout);
+      } catch {
+        return reject(failure(code === 0
+          ? 'Unexpected output from the SSH check. Check non-interactive shell startup output.'
+          : `SSH or Node.js check failed: ${stderr.trim() || exitSignal || code}. Verify batch SSH access and the Node.js executable path.`));
+      }
+      if (record(result) && typeof result.error === 'string') return reject(failure(result.error, 422));
+      if (code !== 0 || !record(result) || typeof result.nodeVersion !== 'string'
+        || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(result.nodeVersion)
+        || typeof result.nodePath !== 'string' || typeof result.copilotHome !== 'string' || typeof result.sessions !== 'boolean') {
+        return reject(failure('The SSH check did not return a valid Node.js result.'));
+      }
+      if (Number(result.nodeVersion.split('.')[0]) < 22) return reject(failure('Node.js 22 or later is required.', 422));
+      return resolve({
+        nodeVersion: result.nodeVersion, nodePath: result.nodePath, copilotHome: result.copilotHome, sessions: result.sessions,
+      });
+    });
+  });
 }
 
 export function createRemote(config, {

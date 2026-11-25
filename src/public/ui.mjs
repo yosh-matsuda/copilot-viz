@@ -35,6 +35,7 @@ const ICONS = {
   sun: 'M12 8a4 4 0 1 0 0 8 4 4 0 1 0 0-8M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4',
   moon: 'M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z',
   close: 'M6 6l12 12M18 6L6 18',
+  settings: 'M4 7h16M4 17h16M9 4v6M15 14v6',
 };
 
 export const CATEGORIES = ['shell', 'read', 'edit', 'search', 'web', 'agent', 'ask', 'data', 'mcp', 'other'];

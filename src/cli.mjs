@@ -6,8 +6,8 @@ import { closeSync, openSync, readFileSync, statSync, truncateSync } from 'node:
 import { hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import { MAX_TIMER_MS, minutesToMs, readConfig } from './config.mjs';
 import { copilotHome, parseDuration } from './monitor.mjs';
-import { loadRemotes } from './remote.mjs';
 import { codeVersion, control, DEFAULT_PORT, HERE, running, runtimeDir, socketPath } from './runtime.mjs';
 
 const USAGE = `Usage: copilot-viz [open] [--port N] [--since DURATION] [--no-open]
@@ -25,18 +25,17 @@ Shows the agents, subagents, and tool calls of Copilot CLI sessions in a browser
 
   --port       port on 127.0.0.1 (default ${DEFAULT_PORT}; a free port when it is taken)
   --since      show the sessions whose log changed within this time, e.g. 90m, 24h, 7d
-               (default 24h); running sessions are always shown
+               (24h when not configured); running sessions are always shown
   --no-open    print the link without opening a browser
-  --idle-exit  with serve, stop after this many minutes without a viewer (default never)
+  --idle-exit  with serve, stop after this many minutes without a viewer (never when not configured)
   --pause-remotes
                with serve, disconnect the remote hosts after this many minutes without a page
-               in view, until one is (default 10; 0 never)
+               in view, until one is (10 when not configured; 0 never)
 
-Remote hosts are listed in ~/.copilot/copilot-viz.json; see the README.`;
+Use Settings in the dashboard to manage remote hosts and saved runtime defaults.
+Settings are stored in ~/.copilot/copilot-viz.json. Explicit options override them at startup.`;
 
 const IDLE_EXIT_MINUTES = 10;
-// setTimeout takes a delay up to 2^31 - 1 ms and runs a longer one at once.
-const MAX_TIMER_MS = 2 ** 31 - 1;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const say = (msg) => process.stderr.write(`copilot-viz: ${msg}\n`);
@@ -74,12 +73,14 @@ function options() {
   if (port !== undefined && !(Number.isInteger(port) && port >= 0 && port < 65536)) throw new Error(`bad --port: ${values.port}`);
   const sinceMs = values.since === undefined ? undefined : parseDuration(values.since);
   if (sinceMs === null) throw new Error(`bad --since: ${values.since}`);
-  const idle = values['idle-exit'] === undefined ? 0 : number(values['idle-exit']);
-  if (!(idle >= 0 && Number.isFinite(idle * 60_000))) throw new Error(`bad --idle-exit: ${values['idle-exit']}`);
-  const pause = values['pause-remotes'] === undefined ? 10 : number(values['pause-remotes']);
-  if (!(pause >= 0 && pause * 60_000 <= MAX_TIMER_MS)) throw new Error(`bad --pause-remotes: ${values['pause-remotes']}`);
+  const idle = values['idle-exit'] === undefined ? undefined : number(values['idle-exit']);
+  if (idle !== undefined && minutesToMs(idle) === null) throw new Error(`bad --idle-exit: ${values['idle-exit']}`);
+  const pause = values['pause-remotes'] === undefined ? undefined : number(values['pause-remotes']);
+  if (pause !== undefined && minutesToMs(pause, MAX_TIMER_MS) === null) throw new Error(`bad --pause-remotes: ${values['pause-remotes']}`);
   return {
-    command, port, sinceMs, since: values.since, noOpen: values['no-open'] ?? false, idleExitMs: idle * 60_000, remotePauseMs: pause * 60_000,
+    command, port, sinceMs, since: values.since, noOpen: values['no-open'] ?? false,
+    idleExitMs: idle === undefined ? undefined : minutesToMs(idle),
+    remotePauseMs: pause === undefined ? undefined : minutesToMs(pause, MAX_TIMER_MS),
   };
 }
 
@@ -99,11 +100,14 @@ function spawnServer(logPath, opt) {
   } catch {
     // No log yet.
   }
-  const args = [join(HERE, 'cli.mjs'), 'serve', '--idle-exit', String(IDLE_EXIT_MINUTES)];
+  const args = [join(HERE, 'cli.mjs'), 'serve'];
   if (opt.port !== undefined) args.push('--port', String(opt.port));
   if (opt.since !== undefined) args.push('--since', opt.since);
   const fd = openSync(logPath, 'a', 0o600);
-  const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', fd, fd] });
+  // A background launch default must not override a saved idle timeout.
+  const child = spawn(process.execPath, args, {
+    env: { ...process.env, _COPILOT_VIZ_BACKGROUND: '1' }, detached: true, stdio: ['ignore', fd, fd],
+  });
   closeSync(fd);
   child.unref();
 }
@@ -122,6 +126,7 @@ function difference(st, opt, version) {
   if (st.copilotHome !== copilotHome()) return 'a different COPILOT_HOME';
   if (st.version !== version) return 'its code changed';
   if (JSON.stringify(st.remotes ?? []) !== JSON.stringify(opt.remotes)) return 'its remote configuration changed';
+  if (st.configError || (st.config && JSON.stringify(st.config) !== JSON.stringify(opt.config))) return 'its saved settings changed';
   if (opt.port !== undefined && st.requestedPort !== opt.port) return `--port ${opt.port}`;
   if (opt.sinceMs !== undefined && st.sinceMs !== opt.sinceMs) return `--since ${opt.since}`;
   return null;
@@ -184,7 +189,6 @@ async function openBrowser(url) {
 // socket serves both.
 async function open(dir, sock, opt) {
   const fileLaunch = process.platform === 'darwin' && !process.env.BROWSER?.split(':').some((x) => x.trim());
-  opt.remotes = await loadRemotes();
   const version = await codeVersion();
   const logPath = join(dir, 'server.log');
   const deadline = Date.now() + 15_000;
@@ -205,14 +209,29 @@ async function open(dir, sock, opt) {
       continue;
     }
     const st = r?.body ?? null;
+    if (st?.settingsPending) {
+      if (Date.now() >= deadline) throw new Error('Settings are still being applied. Try copilot-viz again when the save finishes.');
+      await sleep(100);
+      continue;
+    }
+    opt.config = (await readConfig()).config;
+    opt.remotes = opt.config.remotes;
     const why = st && difference(st, opt, version);
     if (!st) {
       if (!spawned) spawnServer(logPath, opt);
       spawned = true;
     } else if (why && !spawned && !restarted) {
+      // A GUI save may have started after /status or finished while the file was being read.
+      const guard = Number.isSafeInteger(st.settingsVersion) ? `&settingsVersion=${st.settingsVersion}` : '';
+      const stopped = await ask('POST', `/stop?pid=${st.pid}${guard}`);
+      if (stopped?.status === 409) {
+        if (Date.now() >= deadline) throw new Error('The server settings keep changing. Try copilot-viz again when the save finishes.');
+        await sleep(100);
+        continue;
+      }
+      if (stopped && stopped.status !== 200) throw new Error(`the server could not stop: ${JSON.stringify(stopped.body)}`);
       say(`restarting the server for ${why}`);
       restarted = true;
-      await ask('POST', `/stop?pid=${st.pid}`);
       await waitGone(sock, st.pid, deadline);
       continue;
     } else if (st.port) {
@@ -250,6 +269,7 @@ async function main() {
       try {
         server = await (await import('./server.mjs')).startServer({
           port: opt.port, sinceMs: opt.sinceMs, idleExitMs: opt.idleExitMs, remotePauseMs: opt.remotePauseMs,
+          defaultIdleExitMs: process.env._COPILOT_VIZ_BACKGROUND === '1' ? IDLE_EXIT_MINUTES * 60_000 : 0,
         });
       } catch (e) {
         if (e.code !== 'RUNNING') throw e;

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
-import { link, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { createServer as httpServer, request } from 'node:http';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -156,7 +156,15 @@ async function paired(sock) {
       await sleep(15);
     }
   }
-  return { st, token, headers, state, stateWhen };
+  const readSettings = async () => {
+    const response = await get(st.port, '/api/settings', { headers });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const saveSettings = (config, revision) => get(st.port, '/api/settings', {
+    method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ config, revision }),
+  });
+  return { st, token, headers, state, stateWhen, readSettings, saveSettings };
 }
 
 test('finds the owners of the client end in the socket tables', () => {
@@ -549,6 +557,404 @@ const clock = `
   mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
   process.on('message', (ms) => { mock.timers.tick(ms); process.send('ticked'); });
 `;
+
+test('settings are authenticated, revision checked, and applied without replacing the server or stream', async (t) => {
+  const { env, sock } = await sandbox(t);
+  const dir = join(env.COPILOT_HOME, 'session-state', 'old');
+  await mkdir(dir);
+  const log = join(dir, 'events.jsonl');
+  await writeFile(log, '');
+  const old = new Date(Date.now() - 2 * 3600_000);
+  await utimes(log, old, old);
+  await utimes(dir, old, old);
+  const server = serve(env);
+  const p = await paired(sock);
+  const initial = await p.stateWhen((state) => state.ready && state.sessions.length === 1);
+  const stream = await openStream(p.st.port, p.token);
+  t.after(() => stream.close());
+  const config = { version: 2, since: '24h', idleExitMinutes: 7.5, pauseRemotesMinutes: 0, remotes: [] };
+  for (const [path, method] of [['/api/settings', 'GET'], ['/api/settings', 'PUT'], ['/api/remotes/check', 'POST']]) {
+    assert.equal((await get(p.st.port, path, { method })).status, 401);
+  }
+  let settings = await p.readSettings();
+  assert.equal(settings.revision, null);
+  assert.equal((await p.saveSettings({ ...config, remotes: [{ host: '-bad' }] }, null)).status, 400);
+  assert.equal((await p.saveSettings(config, ['a'.repeat(64)])).status, 400);
+  const large = await get(p.st.port, '/api/settings', { method: 'PUT', headers: p.headers, body: 'x'.repeat((1 << 20) + 1) });
+  assert.equal(large.status, 413);
+  assert.equal(existsSync(settings.path), false);
+  const competing = await Promise.all([p.saveSettings(config, null), p.saveSettings(config, null)]);
+  assert.deepEqual(competing.map((r) => r.status).sort(), [200, 409]);
+  settings = await p.readSettings();
+  assert.deepEqual(JSON.parse(await readFile(settings.path, 'utf8')), config);
+  assert.equal((await lstat(settings.path)).mode & 0o777, 0o600);
+  assert.equal((await p.state()).sessions[0].epoch, initial.sessions[0].epoch);
+  assert.equal((await control(sock, 'GET', '/status')).body.pid, p.st.pid);
+  assert.equal((await p.saveSettings(config, null)).status, 409);
+  const narrowed = await p.saveSettings({ ...config, since: '1h' }, settings.revision);
+  assert.equal(narrowed.status, 200);
+  await p.stateWhen((state) => state.ready && state.sessions.length === 0);
+  const report = await get(p.st.port, '/api/view', {
+    method: 'POST', headers: p.headers, body: JSON.stringify({ viewer: stream.viewer, visible: true, seq: 1 }),
+  });
+  assert.equal(report.status, 200);
+  const st = (await control(sock, 'GET', '/status')).body;
+  assert.deepEqual([st.pid, st.clients, st.sinceMs, st.idleExitMs, st.remotePauseMs], [p.st.pid, 1, 3600_000, 450_000, 0]);
+  stream.close();
+  await control(sock, 'POST', '/stop');
+  await server.exited;
+  const restarted = serve(env);
+  const next = await serverStatus(sock);
+  assert.deepEqual([next.sinceMs, next.idleExitMs, next.remotePauseMs], [3600_000, 450_000, 0]);
+  await control(sock, 'POST', '/stop');
+  await restarted.exited;
+});
+
+test('host-only saves do not persist launch overrides or the background idle default', async (t) => {
+  const { env, sock } = await sandbox(t);
+  const opened = await cli(env, 'open', '--no-open', '--since', '7d');
+  assert.equal(opened.code, 0, opened.stderr);
+  const p = await paired(sock);
+  const settings = await p.readSettings();
+  assert.deepEqual(settings.config, { version: 2, remotes: [] });
+  assert.equal((await p.saveSettings(settings.config, settings.revision)).status, 200);
+  let current = (await control(sock, 'GET', '/status')).body;
+  assert.deepEqual([current.sinceMs, current.idleExitMs], [7 * 864e5, 600_000]);
+  assert.equal((await cli(env, 'open', '--no-open')).code, 0);
+  assert.equal((await control(sock, 'GET', '/status')).body.pid, p.st.pid);
+  assert.equal((await cli(env, 'stop')).code, 0);
+  const foreground = serve(env);
+  current = await serverStatus(sock);
+  assert.deepEqual([current.sinceMs, current.idleExitMs], [864e5, 0]);
+  await control(sock, 'POST', '/stop');
+  await foreground.exited;
+  const saved = { version: 2, since: '2h', idleExitMinutes: 3, pauseRemotesMinutes: 5, remotes: [] };
+  await writeFile(settings.path, JSON.stringify(saved));
+  assert.equal((await cli(env, 'open', '--no-open')).code, 0);
+  current = await serverStatus(sock);
+  assert.deepEqual([current.sinceMs, current.idleExitMs, current.remotePauseMs], [7200_000, 180_000, 300_000]);
+  assert.equal((await cli(env, 'stop')).code, 0);
+  const overridden = serve(env, '--since', '1h', '--idle-exit', '0', '--pause-remotes', '0');
+  current = await serverStatus(sock);
+  assert.deepEqual([current.sinceMs, current.idleExitMs, current.remotePauseMs], [3600_000, 0, 0]);
+  assert.deepEqual(JSON.parse(await readFile(settings.path, 'utf8')), saved);
+  await control(sock, 'POST', '/stop');
+  await overridden.exited;
+});
+
+test('open waits for a GUI save and stale restart requests leave the existing viewer connected', { timeout: 10000 }, async (t) => {
+  const { env, sock } = await sandbox(t);
+  await labRemote(env);
+  const child = fixtureServer(t, env, `
+    import fs from 'node:fs/promises';
+    import { syncBuiltinESMExports } from 'node:module';
+    const rename = fs.rename;
+    fs.rename = async (...args) => {
+      await rename(...args);
+      if (String(args[1]).endsWith('/copilot-viz.json')) {
+        process.send('committed');
+        await new Promise((resolve) => process.once('message', resolve));
+      }
+    };
+    syncBuiltinESMExports();
+  `);
+  const p = await paired(sock);
+  await p.stateWhen((state) => state.ready && state.sessions.length === 2);
+  const stream = await openStream(p.st.port, p.token);
+  t.after(() => stream.close());
+  const settings = await p.readSettings();
+  const committed = once(child, 'message');
+  const saving = p.saveSettings({ ...settings.config, remotes: [] }, settings.revision);
+  await committed;
+  const pending = (await control(sock, 'GET', '/status')).body;
+  assert.equal(pending.settingsPending, true);
+  assert.equal((await control(sock, 'POST', `/stop?pid=${p.st.pid}&settingsVersion=${pending.settingsVersion}`)).status, 409);
+  const opening = cli(env, 'open', '--no-open');
+  await sleep(150);
+  child.send('continue');
+  assert.equal((await saving).status, 200);
+  const result = await opening;
+  assert.equal(result.code, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /restarting/);
+  assert.equal((await control(sock, 'POST', `/stop?pid=${p.st.pid}&settingsVersion=${p.st.settingsVersion}`)).status, 409);
+  const current = (await control(sock, 'GET', '/status')).body;
+  assert.equal(current.pid, p.st.pid);
+  assert.equal(current.settingsPending, false);
+  assert.equal(current.clients, 1);
+  const view = await get(p.st.port, '/api/view', {
+    method: 'POST', headers: p.headers, body: JSON.stringify({ viewer: stream.viewer, visible: true, seq: 1 }),
+  });
+  assert.equal(view.status, 200);
+  const exited = once(child, 'exit');
+  await control(sock, 'POST', '/stop');
+  await exited;
+});
+
+test('the idle setting can enable and disable shutdown on a running server', async (t) => {
+  const { env, sock } = await sandbox(t);
+  const child = fixtureServer(t, env, clock);
+  const p = await paired(sock);
+  let settings = await p.readSettings();
+  const config = { ...settings.config, idleExitMinutes: 1 };
+  assert.equal((await p.saveSettings(config, settings.revision)).status, 200);
+  await advance(child, 30_000);
+  assert.equal((await control(sock, 'GET', '/status')).body.pid, child.pid);
+  settings = await p.readSettings();
+  assert.equal((await p.saveSettings({ ...config, idleExitMinutes: 0 }, settings.revision)).status, 200);
+  await advance(child, 60_000);
+  assert.equal((await control(sock, 'GET', '/status')).body.pid, child.pid);
+  settings = await p.readSettings();
+  assert.equal((await p.saveSettings({ ...config, idleExitMinutes: 0.5 }, settings.revision)).status, 200);
+  await advance(child, 29_999);
+  assert.equal((await control(sock, 'GET', '/status')).body.pid, child.pid);
+  const exited = once(child, 'exit');
+  child.send(1);
+  await exited;
+  assert.equal(existsSync(sock), false);
+});
+
+test('the first GUI host uses the pinned worker and pause changes apply without a server restart', async (t) => {
+  const { env, sock } = await sandbox(t);
+  const { config, pidFile } = await labRemote(env);
+  await writeFile(config, JSON.stringify({ version: 1, remotes: [] }));
+  const child = fixtureServer(t, env, `
+    import fs from 'node:fs/promises';
+    import { syncBuiltinESMExports } from 'node:module';
+    const read = fs.readFile;
+    let upgraded = false;
+    fs.readFile = async (path, ...args) => {
+      if (upgraded && /\\/(worker|collector|model|monitor|wire)\\.mjs$/.test(String(path))) throw new Error('package files changed after startup');
+      return read(path, ...args);
+    };
+    process.on('message', () => { upgraded = true; process.send('armed'); });
+    syncBuiltinESMExports();
+  `);
+  const p = await paired(sock);
+  const armed = once(child, 'message');
+  child.send('upgrade');
+  await armed;
+  let settings = await p.readSettings();
+  const withHost = { version: 2, pauseRemotesMinutes: 0, remotes: [{ host: 'lab' }] };
+  assert.equal((await p.saveSettings(withHost, settings.revision)).status, 200);
+  await p.stateWhen((state) => state.hosts.find((h) => h.id === 'ssh:lab')?.state === 'live');
+  const worker = Number(await readFile(pidFile, 'utf8'));
+  await writeFile(config, JSON.stringify({ ...withHost, remotes: [{ host: 'lab', node: '/not-applied/node' }] }));
+  settings = await p.readSettings();
+  assert.equal(settings.config.remotes[0].node, '/not-applied/node');
+  assert.deepEqual(settings.appliedRemotes, [{ host: 'lab', node: 'node' }]);
+  assert.equal((await p.saveSettings({ ...withHost, pauseRemotesMinutes: 0.001 }, settings.revision)).status, 200);
+  await p.stateWhen((state) => state.hosts.find((h) => h.id === 'ssh:lab')?.state === 'paused');
+  for (const until = Date.now() + 5000; running(worker);) {
+    if (Date.now() > until) throw new Error('the paused worker did not exit');
+    await sleep(10);
+  }
+  settings = await p.readSettings();
+  assert.equal((await p.saveSettings(withHost, settings.revision)).status, 200);
+  await p.stateWhen((state) => state.hosts.find((h) => h.id === 'ssh:lab')?.state === 'live');
+  assert.notEqual(Number(await readFile(pidFile, 'utf8')), worker);
+  assert.equal((await control(sock, 'GET', '/status')).body.pid, child.pid);
+});
+
+test('SSH check uploads finish normally, while disconnect and shutdown reap bounded checks', async (t) => {
+  const { env, sock } = await sandbox(t);
+  const bin = join(env.COPILOT_HOME, 'bin');
+  await mkdir(bin);
+  env.CHECK_DIR = env.COPILOT_HOME;
+  env.PATH = `${bin}:${env.PATH}`;
+  await writeFile(join(bin, 'ssh'), `#!${process.execPath}
+const fs = require('node:fs');
+const path = require('node:path');
+const host = process.argv.at(-2);
+fs.writeFileSync(path.join(process.env.CHECK_DIR, host + '.pid'), String(process.pid));
+if (host === 'ok') setTimeout(() => process.stdout.write(JSON.stringify({
+  nodeVersion: '22.0.0', nodePath: '/usr/bin/node', copilotHome: '/home/demo/.copilot', sessions: false
+})), 150);
+else {
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1000);
+}
+`, { mode: 0o700 });
+  const server = serve(env);
+  const p = await paired(sock);
+  const check = (host) => get(p.st.port, '/api/remotes/check', {
+    method: 'POST', headers: p.headers, body: JSON.stringify({ remote: { host } }),
+  });
+  assert.equal((await check('ok')).status, 200);
+  async function begin(host) {
+    const req = request({ host: '127.0.0.1', port: p.st.port, path: '/api/remotes/check', method: 'POST', headers: p.headers, agent: false }, (res) => res.resume());
+    req.on('error', () => {});
+    req.end(JSON.stringify({ remote: { host } }));
+    t.after(() => req.destroy());
+    const pidFile = join(env.COPILOT_HOME, `${host}.pid`);
+    for (const until = Date.now() + 5000; !existsSync(pidFile);) {
+      if (Date.now() > until) throw new Error('the SSH check did not start');
+      await sleep(10);
+    }
+    return { req, pid: Number(await readFile(pidFile, 'utf8')) };
+  }
+  const cancelled = await begin('cancel');
+  cancelled.req.destroy();
+  for (const until = Date.now() + 5000; running(cancelled.pid);) {
+    if (Date.now() > until) throw new Error('the cancelled check kept running');
+    await sleep(10);
+  }
+  const a = await begin('first');
+  const b = await begin('second');
+  assert.equal((await check('third')).status, 429);
+  assert.equal(existsSync(join(env.COPILOT_HOME, 'third.pid')), false);
+  await control(sock, 'POST', '/stop');
+  await server.exited;
+  assert.equal(running(a.pid), false);
+  assert.equal(running(b.pid), false);
+});
+
+test('shutdown waits for an in-flight settings write before releasing its control socket', async (t) => {
+  const { env, sock } = await sandbox(t);
+  const child = fixtureServer(t, env, `
+    import fs from 'node:fs/promises';
+    import { syncBuiltinESMExports } from 'node:module';
+    const open = fs.open;
+    fs.open = async (path, ...args) => {
+      const file = await open(path, ...args);
+      if (String(path).includes('/.copilot-viz-')) {
+        const sync = file.sync.bind(file);
+        file.sync = async () => {
+          process.send('writing');
+          await new Promise((resolve) => process.once('message', resolve));
+          await sync();
+        };
+      }
+      return file;
+    };
+    syncBuiltinESMExports();
+  `);
+  const p = await paired(sock);
+  const settings = await p.readSettings();
+  const writing = once(child, 'message');
+  const response = p.saveSettings({ ...settings.config, since: '7d' }, settings.revision).catch((e) => e);
+  await writing;
+  await control(sock, 'POST', '/stop');
+  assert.equal(existsSync(sock), true);
+  assert.equal(existsSync(settings.path), false);
+  const exited = once(child, 'exit');
+  child.send('continue');
+  await exited;
+  await response;
+  assert.equal(existsSync(sock), false);
+  assert.equal(existsSync(settings.path), false);
+  assert.equal((await readdir(env.COPILOT_HOME)).some((name) => name.endsWith('.tmp')), false);
+});
+
+test('a post-save application failure stays visible and the next open recovers from disk', async (t) => {
+  const { env, sock } = await sandbox(t);
+  const { config } = await labRemote(env);
+  await writeFile(config, JSON.stringify({ version: 1, remotes: [] }));
+  const child = fixtureServer(t, env, `
+    import cp from 'node:child_process';
+    import { syncBuiltinESMExports } from 'node:module';
+    const spawn = cp.spawn;
+    cp.spawn = (command, ...args) => {
+      if (command === 'ssh') throw new Error('injected SSH launch failure');
+      return spawn(command, ...args);
+    };
+    syncBuiltinESMExports();
+  `);
+  const p = await paired(sock);
+  const settings = await p.readSettings();
+  const response = await p.saveSettings({ ...settings.config, remotes: [{ host: 'lab' }] }, settings.revision);
+  assert.equal(response.status, 500);
+  assert.match(response.json().error, /saved, but could not be applied/);
+  const failed = (await control(sock, 'GET', '/status')).body;
+  assert.ok(failed.configError);
+  assert.match(response.json().error, /Reload saved settings before Save and apply/);
+  assert.deepEqual(failed.config.remotes, []);
+  assert.equal(JSON.parse(await readFile(config, 'utf8')).remotes[0].host, 'lab');
+  const exited = once(child, 'exit');
+  const recovered = await cli(env, 'open', '--no-open');
+  assert.equal(recovered.code, 0, recovered.stderr);
+  await exited;
+  const next = await paired(sock);
+  assert.notEqual(next.st.pid, child.pid);
+  assert.equal(next.st.configError, null);
+  await next.stateWhen((state) => state.hosts.find((h) => h.id === 'ssh:lab')?.state === 'live');
+  assert.equal((await cli(env, 'stop')).code, 0);
+});
+
+test('a replaced initial collector cannot overwrite a successful settings application with its late error', { timeout: 10000 }, async (t) => {
+  const { env, sock } = await sandbox(t);
+  const child = fixtureServer(t, env, `
+    import fs from 'node:fs/promises';
+    import { syncBuiltinESMExports } from 'node:module';
+    const readdir = fs.readdir;
+    let initial = true;
+    fs.readdir = async (path, ...args) => {
+      if (initial && path === process.env.COPILOT_HOME + '/session-state') {
+        initial = false;
+        await new Promise((resolve) => process.once('message', resolve));
+        throw new Error('late initial collection error');
+      }
+      return readdir(path, ...args);
+    };
+    syncBuiltinESMExports();
+  `);
+  const p = await paired(sock);
+  const settings = await p.readSettings();
+  assert.equal((await p.saveSettings({ ...settings.config, since: '7d' }, settings.revision)).status, 200);
+  child.send('fail the old read');
+  const opened = await cli(env, 'open', '--no-open');
+  assert.equal(opened.code, 0, opened.stderr);
+  const current = (await control(sock, 'GET', '/status')).body;
+  assert.equal(current.pid, p.st.pid);
+  assert.equal(current.configError, null);
+  const exited = once(child, 'exit');
+  await control(sock, 'POST', '/stop');
+  await exited;
+});
+
+test('a failed local reload reports a saved but unapplied history setting and open restores collection', { timeout: 10000 }, async (t) => {
+  const { env, sock } = await sandbox(t);
+  const dir = join(env.COPILOT_HOME, 'session-state', 'local');
+  await mkdir(dir);
+  await writeFile(join(dir, 'events.jsonl'), '');
+  const child = fixtureServer(t, env, `
+    import fs from 'node:fs/promises';
+    import { syncBuiltinESMExports } from 'node:module';
+    const readdir = fs.readdir;
+    let failed = false;
+    process.on('message', (value) => { failed = value; process.send(value); });
+    fs.readdir = async (path, ...args) => {
+      if (failed && path === process.env.COPILOT_HOME + '/session-state') {
+        throw Object.assign(new Error('injected local directory failure'), { code: 'EACCES' });
+      }
+      return readdir(path, ...args);
+    };
+    syncBuiltinESMExports();
+  `);
+  const p = await paired(sock);
+  await p.stateWhen((state) => state.ready && state.sessions.length === 1);
+  const settings = await p.readSettings();
+  let changed = once(child, 'message');
+  child.send(true);
+  await changed;
+  const saved = await p.saveSettings({ ...settings.config, since: '7d' }, settings.revision);
+  assert.equal(saved.status, 500);
+  assert.match(saved.json().error, /saved, but could not be applied: injected local directory failure/);
+  assert.ok((await control(sock, 'GET', '/status')).body.configError);
+  assert.equal(JSON.parse(await readFile(settings.path, 'utf8')).since, '7d');
+  changed = once(child, 'message');
+  child.send(false);
+  await changed;
+  const exited = once(child, 'exit');
+  const opened = await cli(env, 'open', '--no-open');
+  assert.equal(opened.code, 0, opened.stderr);
+  await exited;
+  const restored = await paired(sock);
+  assert.notEqual(restored.st.pid, p.st.pid);
+  assert.equal(restored.st.sinceMs, 7 * 864e5);
+  assert.equal(restored.st.configError, null);
+  await restored.stateWhen((state) => state.ready && state.sessions.some((s) => s.id === 'local'));
+  assert.equal((await cli(env, 'stop')).code, 0);
+});
 
 test('pairing grants a fresh idle window to connect the stream', async (t) => {
   const { env, sock } = await sandbox(t);

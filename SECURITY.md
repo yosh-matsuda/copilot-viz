@@ -4,6 +4,11 @@ copilot-viz shows the contents of Copilot CLI session logs, which can include se
 another user or a web page to read the dashboard, or for a remote host to run code on your
 machine, is a vulnerability.
 
+A paired viewer is trusted to administer the dashboard. Settings can write the server's
+copilot-viz configuration and run configured programs through the server user's SSH access.
+Do not share pairing links with read-only viewers or other people you would not trust with
+that access. SSH checks are not a sandbox for a custom executable or worker.
+
 ## Reporting a vulnerability
 
 Report it privately through

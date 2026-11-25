@@ -6,12 +6,18 @@ import { createRemote } from './remote.mjs';
 import { unavailable } from './wire.mjs';
 
 const ACTIVE = new Set(['running', 'starting', 'input', 'waiting']);
+// Replacing a source set or re-adding a host must not reuse an earlier connection epoch.
+let connectionGeneration = 0;
 
-export function createSources({ remotes = [], bundle = null, sinceMs, onMessage, onError, remoteFactory = createRemote }) {
+export function createSources({ home, remotes = [], bundle = null, sinceMs, onMessage, onError, remoteFactory = createRemote }) {
   const hosts = new Map();
   const sessions = new Map();
   let rev = 0;
   let stopped = false;
+  let started = false;
+  let paused = false;
+  let stopping;
+  const retiring = new Set();
   const makeHost = (id, name, remote) => {
     const h = { id, name, remote, state: 'connecting', error: null, retryAt: null, lastSeen: null, settled: false, generation: 0, raw: new Map(), invalid: new Set(), offset: 0, sourceNow: null };
     hosts.set(id, h);
@@ -39,7 +45,7 @@ export function createSources({ remotes = [], bundle = null, sinceMs, onMessage,
     return s;
   }
   function publish(h, ids = [], removed = []) {
-    if (stopped) return;
+    if (stopped || hosts.get(h.id) !== h) return;
     rev++;
     const changed = ids.map((id) => project(h, h.raw.get(id)));
     for (const id of removed) sessions.delete(id);
@@ -47,7 +53,7 @@ export function createSources({ remotes = [], bundle = null, sinceMs, onMessage,
     onMessage({ type: 'delta', now: Date.now(), rev, ready: ready(), hosts: hostList(), sessions: changed, removed });
   }
   function receive(h, msg) {
-    if (stopped) return;
+    if (stopped || hosts.get(h.id) !== h) return;
     const now = Date.now();
     const batch = msg.type === 'snapshot' || msg.type === 'delta';
     if (batch && (!Number.isFinite(msg.now) || !Array.isArray(msg.sessions)
@@ -77,7 +83,7 @@ export function createSources({ remotes = [], bundle = null, sinceMs, onMessage,
       if (msg.type === 'snapshot') {
         // An invalid replacement leaves the last accepted copy alone.
         for (const id of h.raw.keys()) if (!present.has(id)) remove(id);
-        if (h.state !== 'live') h.generation++;
+        if (h.state !== 'live') h.generation = ++connectionGeneration;
       }
       for (const id of msg.removed ?? []) if (!present.has(id)) remove(id);
       for (const s of accepted) h.raw.set(s.id, s);
@@ -97,14 +103,17 @@ export function createSources({ remotes = [], bundle = null, sinceMs, onMessage,
       publish(h);
     }
   }
-  local.collector = createCollector({ sinceMs, onMessage: (msg) => receive(local, msg), onError });
-  for (const config of remotes) {
+  local.collector = createCollector({ home, sinceMs, onMessage: (msg) => receive(local, msg), onError });
+  function addRemote(config) {
     const h = makeHost(`ssh:${config.host}`, config.host, true);
+    h.config = config;
+    h.started = false;
     h.connection = remoteFactory(config, {
       sinceMs,
       bundle,
       onMessage: (msg) => receive(h, msg),
       onState: (state, error, retryAt) => {
+        if (stopped || hosts.get(h.id) !== h) return;
         const leavingLive = h.state === 'live' && state !== 'live';
         h.state = state;
         h.error = error;
@@ -118,30 +127,74 @@ export function createSources({ remotes = [], bundle = null, sinceMs, onMessage,
         }
       },
     });
+    return h;
+  }
+  for (const config of remotes) addRemote(config);
+  function retire(h) {
+    const done = Promise.resolve().then(() => h.connection.stop()).finally(() => retiring.delete(done));
+    retiring.add(done);
+    return done;
+  }
+  function startRemote(h) {
+    if (!started || stopped || h.started || hosts.get(h.id) !== h) return;
+    if (paused) h.connection.pause();
+    h.connection.start();
+    h.started = true;
   }
   return {
     start() {
+      started = true;
       local.state = 'loading';
-      local.collector.start().catch((e) => {
+      const loading = local.collector.start().catch((e) => {
         local.state = 'offline';
         local.error = e.message;
         local.settled = true;
-        onError(e);
         publish(local);
+        throw e;
       });
-      for (const h of hosts.values()) h.connection?.start();
+      return Promise.all([loading, ...[...hosts.values()].filter((h) => h.remote).map(async (h) => startRemote(h))]);
     },
     // The sessions of a paused host stay, marked stale like those of a disconnected one.
     pause() {
-      for (const h of hosts.values()) h.connection?.pause();
+      paused = true;
+      for (const h of hosts.values()) if (h.started) h.connection.pause();
     },
     resume() {
-      for (const h of hosts.values()) h.connection?.resume();
+      paused = false;
+      for (const h of hosts.values()) if (h.started) h.connection.resume();
     },
-    async stop() {
+    async updateRemotes(next) {
+      if (stopped) throw unavailable('The server is stopping.');
+      const configs = new Map(next.map((config) => [`ssh:${config.host}`, config]));
+      const removed = [];
+      const pending = [];
+      const hadRemotes = remotes.length > 0;
+      for (const h of hosts.values()) {
+        if (!h.remote || JSON.stringify(h.config) === JSON.stringify(configs.get(h.id))) continue;
+        hosts.delete(h.id);
+        for (const id of h.raw.keys()) removed.push(sessionId(h, id));
+        pending.push(retire(h));
+      }
+      remotes = next;
+      const added = next.filter((config) => !hosts.has(`ssh:${config.host}`)).map(addRemote);
+      const ordered = [local, ...next.map((config) => hosts.get(`ssh:${config.host}`))];
+      hosts.clear();
+      for (const h of ordered) hosts.set(h.id, h);
+      publish(local, hadRemotes !== (next.length > 0) ? [...local.raw.keys()] : [], removed);
+      await Promise.all(pending);
+      if (stopped) throw unavailable('The server is stopping.');
+      for (const h of added) startRemote(h);
+    },
+    stop() {
+      if (stopping) return stopping;
       stopped = true;
       local.collector.stop();
-      await Promise.all([...hosts.values()].map((h) => h.connection?.stop()));
+      for (const h of hosts.values()) if (h.connection) retire(h);
+      stopping = Promise.allSettled(retiring).then((results) => {
+        const failures = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+        if (failures.length) throw new AggregateError(failures, 'Could not stop all SSH connections.');
+      });
+      return stopping;
     },
     snapshot: () => ({ type: 'snapshot', now: Date.now(), rev, ready: ready(), hosts: hostList(), sessions: [...sessions.values()] }),
     async callDetail(sid, id, epoch) {

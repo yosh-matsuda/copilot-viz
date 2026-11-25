@@ -22,6 +22,7 @@
       <div class="stat"><dt>Calls 5m</dt><dd id="stat-calls">0</dd></div>
     </dl>
     <span id="conn" class="pill" role="status" aria-live="polite" data-state="connecting">Connecting…</span>
+    <button id="settings-open" class="settings-btn settings-open" type="button" disabled><span>Settings</span></button>
     <button id="theme" class="icon-btn" type="button" title="Toggle theme (t)"></button>
   </header>
 
@@ -90,6 +91,71 @@
     </div>
     <div id="detail-body" class="detail-body"></div>
   </aside>
+
+  <dialog id="settings" class="settings" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <header class="settings-head">
+        <div><h2 id="settings-title" tabindex="-1">Settings</h2><p>Shared by every dashboard connected to this server.</p></div>
+        <button id="settings-close-icon" class="icon-btn" type="button" data-settings-close aria-label="Close settings"></button>
+      </header>
+      <div class="settings-body">
+        <p id="settings-readonly" class="settings-notice" hidden></p>
+        <fieldset id="settings-fields" class="settings-fields" disabled>
+          <section class="settings-section" aria-labelledby="settings-runtime-title">
+            <h3 id="settings-runtime-title">Collection and idle time</h3>
+            <p>Set saved defaults, or leave fields blank to keep launch options and built-in defaults. Saving applies the values shown.</p>
+            <div class="settings-runtime">
+              <div class="settings-field">
+                <label for="settings-since">Session history</label>
+                <input id="settings-since" type="text" maxlength="128" placeholder="24h" spellcheck="false" aria-describedby="settings-since-help settings-since-current">
+                <small id="settings-since-help">For example 90m, 24h, or 7d. Running sessions are always included. Changing this re-reads logs on all hosts.</small>
+                <small id="settings-since-current"></small>
+              </div>
+              <div class="settings-field">
+                <label for="settings-idle">Stop idle server (minutes)</label>
+                <input id="settings-idle" type="number" min="0" step="any" aria-describedby="settings-idle-help settings-idle-current">
+                <small id="settings-idle-help">Stop after no dashboard is connected. A hidden tab still counts as connected. 0 means never.</small>
+                <small id="settings-idle-current"></small>
+              </div>
+              <div class="settings-field">
+                <label for="settings-pause">Pause SSH (minutes)</label>
+                <input id="settings-pause" type="number" min="0" step="any" aria-describedby="settings-pause-help settings-pause-current">
+                <small id="settings-pause-help">Disconnect while no dashboard is visible; reconnect when one is visible again. 0 means never.</small>
+                <small id="settings-pause-current"></small>
+              </div>
+            </div>
+          </section>
+          <section class="settings-section" aria-labelledby="settings-ssh-title">
+            <h3 id="settings-ssh-title">SSH hosts</h3>
+            <p>Uses the SSH configuration on <strong id="settings-machine"></strong>, where copilot-viz runs, not the browser's machine. Keys and passwords stay outside this app.</p>
+            <details class="settings-help">
+              <summary>Before adding a host</summary>
+              <ol>
+                <li>Configure SSH on the machine running copilot-viz. For WSL, use the SSH configuration inside WSL.</li>
+                <li>Run <code>ssh build-server</code> in a terminal. Verify the host fingerprint before accepting it, and unlock your key through <code>ssh-agent</code> if needed.</li>
+                <li>Verify <code>ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none build-server 'node --version'</code> succeeds without a prompt and reports Node.js 22 or later.</li>
+                <li>Enter that same host name below. Use Check connection, then Save and apply. The worker is installed automatically when connecting.</li>
+              </ol>
+              <p>The check tests SSH, Node.js, and access to the session directory. It does not install the worker or read session logs. An offline host can still be saved.</p>
+            </details>
+            <div id="settings-remotes" class="settings-remotes"></div>
+            <button id="settings-add" class="settings-btn" type="button">Add SSH host</button>
+            <p class="settings-muted">Up to 32 hosts. Removing a host disconnects it after saving; it does not delete its logs or cached worker.</p>
+          </section>
+        </fieldset>
+        <p class="settings-location">Saved on this server in <code id="settings-path"></code>. Linked files must be edited manually.</p>
+        <p class="settings-muted">Only share pairing links with people you trust to change these settings and use this server's SSH access.</p>
+      </div>
+      <footer class="settings-footer">
+        <p id="settings-message" role="status" aria-live="polite"></p>
+        <div class="settings-actions">
+          <button id="settings-reload" class="settings-btn" type="button">Reload saved settings</button>
+          <button class="settings-btn" type="button" data-settings-close>Close</button>
+          <button id="settings-save" class="settings-btn primary" type="submit" disabled>Save and apply</button>
+        </div>
+      </footer>
+    </form>
+  </dialog>
 
   <div id="overlay" class="overlay" hidden>
     <div class="overlay-card" role="alertdialog" aria-modal="true" aria-labelledby="overlay-title" aria-describedby="overlay-text">

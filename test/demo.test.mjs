@@ -61,6 +61,15 @@ test('the isolated demo serves the real UI and synthetic API, but no files outsi
   const pair = await fetch(`${base}/api/pair`, { method: 'POST', body: JSON.stringify({ code: 'demo' }) });
   assert.equal(pair.status, 200);
   const { token } = await pair.json();
+  const headers = { Authorization: `Bearer ${token}` };
+  assert.equal((await fetch(`${base}/api/settings`)).status, 401);
+  const settings = await (await fetch(`${base}/api/settings`, { headers })).json();
+  assert.equal(settings.readOnly, true);
+  assert.deepEqual(settings.config.remotes.map((host) => host.host).sort(), ['build-box', 'test-box']);
+  assert.match(await (await fetch(`${base}/settings.mjs`)).text(), /createSettings/);
+  for (const [path, method] of [['/api/settings', 'PUT'], ['/api/remotes/check', 'POST']]) {
+    assert.equal((await fetch(base + path, { method, headers, body: '{}' })).status, 403);
+  }
   const stream = await fetch(`${base}/api/stream?token=${token}`);
   const reader = stream.body.getReader();
   let text = '';

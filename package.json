@@ -1,0 +1,37 @@
+{
+  "name": "copilot-viz",
+  "version": "0.1.0",
+  "description": "A live browser dashboard of the agents, subagents, tool calls, and shells of GitHub Copilot CLI sessions, on this machine and over SSH.",
+  "keywords": [
+    "github-copilot",
+    "copilot-cli",
+    "agents",
+    "subagents",
+    "dashboard",
+    "visualization",
+    "ssh"
+  ],
+  "homepage": "https://github.com/yosh-matsuda/copilot-viz#readme",
+  "bugs": "https://github.com/yosh-matsuda/copilot-viz/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yosh-matsuda/copilot-viz.git"
+  },
+  "license": "MIT",
+  "author": "Yoshiki Matsuda",
+  "type": "module",
+  "bin": {
+    "copilot-viz": "src/cli.mjs"
+  },
+  "files": [
+    "src/",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test 'test/*.test.mjs'",
+    "smoke": "sh scripts/smoke.sh"
+  }
+}

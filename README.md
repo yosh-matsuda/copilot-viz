@@ -6,6 +6,18 @@ timeline, and an activity feed, for the sessions on this machine and on SSH host
 
 copilot-viz is an unofficial tool. It is not affiliated with or endorsed by GitHub.
 
+![Copilot Viz showing three parallel subagents, two background shells, a tool-call timeline, and sessions on local and remote hosts.](https://raw.githubusercontent.com/yosh-matsuda/copilot-viz/main/docs/demo.png)
+
+*The real dashboard with synthetic demo data. All sessions, prompts, commands, results, and hosts
+in these images are fictional; no real session logs are shown.*
+
+<details>
+<summary>Watch the 20-second demo</summary>
+
+![Animated demo: parallel agents and shells finish, test output opens, and the view switches to a remote session.](https://raw.githubusercontent.com/yosh-matsuda/copilot-viz/main/docs/demo.gif)
+
+</details>
+
 ## Features
 
 - **Sessions**: the sessions whose log changed recently, running ones first. *Follow* keeps the
@@ -130,6 +142,23 @@ The code has no dependencies.
 npm test         # unit and integration tests
 npm run smoke    # pack, install into a temporary prefix, and run the installed command
 ```
+
+### Demo capture
+
+From a repository checkout, run `npm run demo` and open the printed URL. This development-only
+server listens on `127.0.0.1` and serves the real UI with authored events processed by the normal
+session model. It never reads Copilot logs or SSH configuration, and never executes the sample
+commands. It is not included in the npm package.
+
+The scenario starts when the first browser connects. Select **5m** to show the recent timeline.
+The three subagents and two background shells finish over the next 12 seconds; the remote
+benchmark finishes at 19 seconds. Once the tests finish, open **read_bash shell tests** in the
+activity feed to see their output, and select **Benchmark search** to show the remote session.
+Stop with Ctrl+C and restart to record another take.
+
+The README uses a dark-theme capture at 1680 x 1000. Keep the **DEMO** label
+visible when recording or replacing the images. Media is linked from GitHub so that the npm
+README can display it without adding the images to the installed package.
 
 ## Acknowledgements
 
